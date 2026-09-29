@@ -1,0 +1,14 @@
+[Unit]
+Description=Jarvis desktop widget
+After=jarvis.service
+PartOf=jarvis.service
+
+[Service]
+WorkingDirectory=%h/jarvis
+ExecStart=%h/jarvis/.venv/bin/python %h/jarvis/widget.py
+Environment=QT_QPA_PLATFORM=wayland
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=jarvis.service

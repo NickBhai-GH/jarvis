@@ -1,0 +1,15 @@
+[Unit]
+Description=Jarvis voice assistant
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+WorkingDirectory=%h/jarvis
+ExecStart=%h/jarvis/.venv/bin/python %h/jarvis/jarvis.py
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
