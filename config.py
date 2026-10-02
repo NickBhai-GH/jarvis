@@ -18,7 +18,8 @@ WRITE_OK_DIRS = []
 
 # Brain
 MODEL = "claude-opus-5-5"
-EFFORT = "medium"          # low / medium / high: higher = smarter but slower to answer
+JUDGE_MODEL = "claude-sonnet-5"   # decides workers' permission requests before any reach you
+EFFORT = "medium"         # low / medium / high: higher = smarter but slower to answer
 SESSION_IDLE_RESET_MIN = 30   # after this long with nothing going on, the next request gets a fresh session
 NOTES_FILE = os.path.join(JARVIS_DIR, "notes.md")   # running summary carried from session to session
 PERSONA_FILE = os.path.join(JARVIS_DIR, "persona.md")
@@ -44,11 +45,18 @@ SPEED = 1.05
 KOKORO_MODEL = os.path.join(JARVIS_DIR, "models", "kokoro-v1.0.onnx")
 KOKORO_VOICES = os.path.join(JARVIS_DIR, "models", "voices-v1.0.bin")
 
+# Don't talk over your calls: unprompted speech (worker updates, timers) waits while you're on a call (another app
+# has a mic) and anyone on it is talking; the widget shows "Update ready" meanwhile. "Hey Jarvis" delivers it now.
+POLITE = True
+POLITE_QUIET_S = 1.5       # nobody on the call (you or them) has talked for this long = go ahead
+POLITE_CALL_LEVEL = 200    # the call app's playback louder than this (16-bit RMS) = the other people are talking
+POLITE_MAX_WAIT_S = 60     # held this long: also a desktop notification (still waits for quiet or "Hey Jarvis")
+
 # Desktop widget
 WIDGET_SCREEN = "right"        # monitor by connector name (e.g. "HDMI-A-1", "DP-1"), or "left"/"right"
-WIDGET_CORNER = "top-right"    # top-right, top-left, bottom-right, bottom-left
+WIDGET_CORNER = "bottom-center"  # bottom-center, top-center, top-right, top-left, bottom-right, bottom-left
 WIDGET_MARGIN_X = 16           # pixels from the side
-WIDGET_MARGIN_Y = 40           # pixels from the top/bottom
+WIDGET_MARGIN_Y = 30           # pixels from the top/bottom
 
 # Your own settings go in config_local.py (gitignored), e.g. USER_NAME = "Pepper"
 try:

@@ -92,6 +92,8 @@ class Mouth:
         self.synthesizing = False
         self.out_level = 0.0
         self.on_sentence_start = None     # called (in the event loop) as each sentence starts playing
+        self.hold = None                  # async (token, text): unprompted speech waits on this before it plays
+        self.polite = False               # the sentence in hand is unprompted
         self.stream = sd.OutputStream(samplerate=RATE, channels=1, dtype="float32",
                                       blocksize=1024, callback=self._callback)
 
@@ -123,11 +125,12 @@ class Mouth:
     def chime(self, name):
         self._enqueue_audio(CHIMES[name])
 
-    def say(self, text):
+    def say(self, text, polite=None):
+        """polite: a token for unprompted speech (one per update), so it waits on self.hold first."""
         text = speakable(text)
         if text:
             log.info("say: %s", text)
-            self.textq.put_nowait((self.generation, text))
+            self.textq.put_nowait((self.generation, text, polite))
 
     def stop(self):
         self.generation += 1
@@ -138,10 +141,13 @@ class Mouth:
             self.pos = 0
 
     @property
-    def busy(self):
+    def playing(self):
         with self.lock:
-            playing = bool(self.chunks)
-        return playing or self.synthesizing or not self.textq.empty()
+            return bool(self.chunks)
+
+    @property
+    def busy(self):
+        return self.playing or self.synthesizing or not self.textq.empty()
 
     async def wait_done(self):
         while self.busy:
@@ -155,12 +161,14 @@ class Mouth:
 
     async def _worker(self):
         while True:
-            gen, text = await self.textq.get()
+            gen, text, polite = await self.textq.get()
             if gen != self.generation:
                 continue
-            self.synthesizing = True
+            self.synthesizing, self.polite = True, polite is not None
             try:
                 audio = await self.loop.run_in_executor(None, self._synth, text)
+                if self.polite and self.hold:
+                    await self.hold(polite, text)
                 if gen == self.generation:
                     self._enqueue_audio(audio.astype(np.float32), text)
             except Exception:

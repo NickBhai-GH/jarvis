@@ -1,6 +1,6 @@
 # Jarvis
 
-A voice assistant for your Linux desktop that talks like J.A.R.V.I.S. from the Iron Man films. Say **"Hey Jarvis"**, wait for the chime, talk. The brain is a long-running Claude Code session (through the Claude Agent SDK), so it can do anything Claude Code can: run commands, edit files, search the web, drive Chrome. On top of that it gets its own desktop tools: open apps, focus windows, take screenshots, click, scroll, type, control media and volume.
+A voice assistant for your Linux desktop that talks like J.A.R.V.I.S. from the Iron Man films. Say **"Hey Jarvis"**, wait for the chime, talk. The brain is a long-running Claude Code session (through the Claude Agent SDK), so it can do anything Claude Code can: run commands, edit files, search the web, drive Chrome. On top of that it gets its own desktop tools: open apps, focus windows, take screenshots, click, scroll, type, control media and volume, and draw on your screen to show you where things are. Longer jobs go to background workers so it stays free to talk.
 
 How it fits together:
 
@@ -8,7 +8,8 @@ How it fits together:
 - `brain.py`: one persistent Claude Code session, the persona, and the safety gate that asks you out loud before risky actions.
 - `mouth.py`: text to speech (Kokoro by default, or a Piper voice), cut off the moment you talk over it.
 - `pctools.py` + `kwin.py`: the desktop tools, served to Claude as an in-process MCP server called `jarvis`.
-- `jarvis.py`: the main loop. `dashboard.py` + `dashboard.html`: a local web dashboard. `widget.py`: a small on-screen status panel. `events.py`: the activity log.
+- `worker.py`: background workers, each its own Claude Code session.
+- `jarvis.py`: the main loop. `dashboard.py` + `dashboard.html`: a local web dashboard. `widget.py`: the on-screen status capsule. `overlay.py`: draws rings, arrows and labels on screen. `design.py`: their shared look. `events.py`: the activity log.
 - `persona.md`: the system prompt, a template filled in from your config. `lines.md`: real JARVIS lines by situation, used to tune the voice.
 
 ## Requirements
@@ -18,6 +19,7 @@ How it fits together:
 - A microphone. Headphones are recommended if you want to interrupt it by talking over it.
 - Python 3.12 (what it is tested on).
 - System tools: `ydotool` (and write access to `/dev/uinput`, usually via a udev rule or the `input` group), `spectacle`, `qdbus`, `busctl`, `wpctl`, `pactl`, `notify-send`, `gtk-launch`, `xdg-open`, and PortAudio for `sounddevice`. Most are already there on a KDE desktop.
+- For the widget and the on-screen drawing: the system Python's PySide6 and KDE's layer-shell-qt (on Fedora-based systems `python3-pyside6` and `layer-shell-qt`). Both run on `/usr/bin/python3`, because layer-shell needs the system Qt rather than the venv's.
 - Optional: the Claude in Chrome extension, so it can work in your browser.
 
 ## Install
@@ -61,6 +63,8 @@ VOCAB = "Jarvis, Pepper, Manchester, Spotify, Discord, Konsole."
 | `VOICE` | Kokoro voice: bm_lewis, bm_george, bm_daniel, bm_fable |
 | `VOICE_ENGINE` / `PIPER_MODEL` | Switch to your own Piper voice (see below) |
 | `MODEL` / `EFFORT` | Claude model and effort level |
+| `JUDGE_MODEL` | Cheaper model that approves routine worker steps |
+| `POLITE` | Hold unprompted speech while you are on a call (`POLITE_*` tune it) |
 | `WAKE_THRESHOLD` | Raise if it wakes on its own, lower if it ignores you |
 | `END_SILENCE_S` | Raise if it cuts you off mid-sentence |
 | `MIC_DEVICE` | None for the system default input |
@@ -111,16 +115,42 @@ Each conversation is a fresh Claude session. A new one starts after 30 minutes i
 
 `persona.md` is the system prompt. `$USER_NAME`, `$HONORIFIC`, `$CITY` and `$LINES_FILE` are filled in from the config. Change anything you like. The speaking style is built from real JARVIS lines, collected by situation in `lines.md`. Every message gets a time tag (`[Mon 28 Sep, 07:42, first today]`), so it greets you on your first message of the day, says welcome back after a few hours away, and notices when it is past midnight.
 
+## Widget
+
+A Dynamic Island style capsule (bottom centre by default), on top of everything including fullscreen windows, click-through and never focused. Resting, it's a small dark pill. It opens when you start talking and shows what it heard, the step it's on while thinking, and each sentence as it speaks; an orange orb means it's waiting for a yes/no. Previews: `docs/widget-*.png`. It runs as the `jarvis-widget` service, on the system `/usr/bin/python3` (KDE layer-shell needs the system Qt). Move it with `WIDGET_SCREEN` / `WIDGET_CORNER` / `WIDGET_MARGIN_*`. Colours, fonts and motion live in `design.py`.
+
+## Show me where
+
+Ask "where's the graphics setting?" or "how do I open the map?" and it takes a screenshot, then draws on your screen (rings, arrows, boxes, numbered steps; see `docs/overlay-preview.png`) while it talks you through it. It doesn't click unless you ask.
+
+- Tools: `annotate` (shapes in the latest screenshot's pixels, same mapping as `click_at`) and `clear_annotations`.
+- `overlay.py` is a KDE layer-shell surface, one per monitor, with an empty input region so clicks go straight through. Games that take the display directly (gamescope, VR) can't be drawn over.
+- Try it: `/usr/bin/python3 overlay.py '{"duration": 5, "shapes": [{"type": "ring", "x": 960, "y": 540, "radius": 60, "label": "Here", "step": 1}]}'`
+
+## Workers
+
+For a job that takes more than a minute or so, or when you say "and also have Y going", Jarvis starts a **worker**: a separate Claude Code session in the background with a short name ("the video edit"), and stays free for you. Several can run at once.
+
+- "What are the workers doing?", "tell the video one to use 2x", "stop the report": `list_workers` / `message_worker` / `stop_worker`.
+- When one finishes, or needs you, Jarvis says so in a sentence.
+- Permissions: a worker's risky steps go to a judge model (`JUDGE_MODEL`) first, which approves routine steps that fit the brief and passes the rest to you as a spoken question. Pressing Enter always comes to you.
+- Take one over: ask Jarvis to stop it, then `claude --resume <session id>` in a terminal.
+
+## Not talking over your calls
+
+Things Jarvis says on its own (a worker finishing, a timer) wait while you're on a call and someone is talking: another app holding the mic (Discord, Zoom, Meet in a browser) counts as a call, and each call app's playback level shows when the other people are talking. The widget shows the update is ready meanwhile; "Hey Jarvis" hears it straight away. Settings: `POLITE`, `POLITE_QUIET_S`, `POLITE_CALL_LEVEL`, `POLITE_MAX_WAIT_S`.
+
 ## Safety gate
 
-The gate is `policy` in `brain.py`.
+The gate is `policy` in `brain.py`. It runs as a PreToolUse hook, before Claude Code's own allow rules, so an "always allow" rule in your settings can't skip it.
 
 - Allowed without asking: reading, searching, the desktop tools (except Enter), Chrome browsing and clicking, safe Bash, file edits inside your home folder and `WRITE_OK_DIRS`.
-- Asks out loud first, with a spoken yes/no: deleting or moving files, sudo, systemctl, git push, POST requests, sending email, anything else that writes somewhere outside, and pressing Enter (that is how most apps send).
-- Clicks are not gated, so the persona tells it to ask before clicking Send, Post, Buy or Delete.
-- No answer counts as no.
+- Asks out loud first: deleting or moving files (including `/bin/rm`, `find -delete` and deletes inside scripts), sudo, systemctl, ssh/scp, git push, POST requests, writes to shell and Claude settings files, edits to the gate's own code and config, and pressing Enter (that is how most apps send).
+- **One yes per request**: once you say yes, the rest of that request doesn't ask again. Questions are one short line and name the risky command ("Shall I restart the widget, which runs systemctl?").
+- A yes only counts at the start of your answer, so a "yes" in the middle of something you said to someone else doesn't approve anything. No answer counts as no.
+- Clicks are not gated, so the persona tells it to ask before clicking Send, Post, Buy or Delete. Clicking and typing refuse if another window took focus since the last screenshot, or the screenshot is over a minute old.
 
-Read `policy` before you trust it with anything important, and add your own rules there.
+The command rules are pattern matching, not a sandbox. Read `policy` before you trust it with anything important, and add your own rules there.
 
 ## Voice
 
@@ -129,6 +159,10 @@ Kokoro works out of the box with British voices (`bm_lewis` is the default). If 
 ## Tests
 
 ```
+.venv/bin/python test_gate.py        # which commands ask, the gate hook, the wrong-window guard
+.venv/bin/python test_workers.py     # worker permission routing, one yes per request
+.venv/bin/python test_polite.py      # call detection and holding speech during calls
+.venv/bin/python test_annotate.py    # screenshot-to-desktop mapping for the overlay
 .venv/bin/python test_time_tag.py    # the greeting time tags
 .venv/bin/python test_voice.py "Good evening."   # writes logs/voice-kokoro.wav (and piper if set)
 ```

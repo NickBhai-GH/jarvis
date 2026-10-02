@@ -275,7 +275,7 @@ function buildTurns() {
 // ---------- rendering ----------
 function renderStatus() {
   const a = meter.activity || (snap && snap.activity) || "idle";
-  const words = {idle: "Idle", listening: "Listening", thinking: "Thinking", speaking: "Speaking", waiting: "Waiting for your yes or no"};
+  const words = {idle: "Idle", listening: "Listening", thinking: "Thinking", speaking: "Speaking", waiting: "Waiting for your yes or no", ready: "Update ready (waiting for a quiet moment on your call)"};
   const el = $("status");
   el.textContent = connected ? (words[a] || a) : "Not running";
   el.className = a === "waiting" ? "waiting" : (a === "idle" || !connected ? "" : "active");
@@ -503,6 +503,8 @@ async function send(cmd, text) {
   try {
     const r = await fetch("/api/cmd", {method: "POST", headers: {"Content-Type": "application/json", "X-Jarvis-Token": TOKEN},
       body: JSON.stringify({cmd, text})});
+    // Jarvis restarted since this tab loaded, so its token is stale: reload to pick up the new one.
+    if (r.status === 403) { $("cmd-reply").textContent = "Jarvis restarted, reloading..."; return setTimeout(() => location.reload(), 800); }
     const j = await r.json();
     $("cmd-reply").textContent = j.reply === "ok" ? "" : j.reply;
   } catch (e) { $("cmd-reply").textContent = "Couldn't reach Jarvis."; }

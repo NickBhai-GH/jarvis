@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
@@ -22,15 +23,19 @@ import dashboard
 import events
 import kwin
 import pctools
+import worker
 from brain import Brain, read_notes, read_state, summarize, write_state
-from ears import Ears
+from ears import CallWatch, Ears
 from mouth import Mouth
 
 IDLE, LISTEN, BUSY = "idle", "listening", "busy"
-YES = re.compile(r"\b(yes|yeah|yep|yup|sure|go ahead|do it|confirm(ed)?|affirmative|ok|okay|please do|proceed|send it)\b", re.I)
+# a yes only counts at the start of the answer, so "but yes, that's right" said on a call doesn't approve
+YES = re.compile(r"^\W*((um+|uh+|erm|hmm+|oh|ah)\W+)*(yes|yeah|yep|yup|sure|go ahead|do it|confirm(ed)?|affirmative|ok|okay|please do|proceed|send it)\b", re.I)
 NEW_SESSION = re.compile(r"^\W*(please\W+)?(start\W+)?(a\W+)?(new|fresh)\W+(session|chat|conversation|start)\W*(please)?\W*$"
                          r"|^\W*fresh start\W*$", re.I)
 NO = re.compile(r"\b(no|nope|don'?t|stop|cancel|wait|hold on|never ?mind)\b", re.I)
+GO_AHEAD = re.compile(r"^\W*((ok(ay)?|yes|yeah|sure|go on|go ahead|tell me|what is it|what'?s up|let'?s hear it|shoot)\W*)+"
+                      r"(then|please|sir)?\W*$", re.I)
 
 
 def time_tag():
@@ -101,6 +106,15 @@ class Jarvis:
         self.mouth.on_sentence_start = lambda text: events.emit("speaking_now", text=text)
         self.live = {"you": "", "said": "", "step": "", "self_started": False}
         events.listen(self.track_live)
+        self.confirm_lock = asyncio.Lock()     # one spoken yes/no at a time (Jarvis and workers share it)
+        worker.confirm = lambda question: self.confirm(question, unprompted=True)
+        self.call = CallWatch()
+        self.last_voice = 0.0         # the user last spoke into Jarvis's mic (VAD), for not talking over them
+        self.held = None              # the unprompted update waiting for a quiet moment (its token)
+        self.deliver = None           # the update he asked for with "Hey Jarvis": plays once he's said his piece
+        self.engaged_listen = None    # that listen: a bare "go ahead" in it isn't a command
+        self.mouth.hold = self.hold_for_quiet
+        worker.notify = lambda message: self.inbox.put_nowait(("worker", message))
 
     @property
     def state(self):
@@ -188,16 +202,21 @@ class Jarvis:
 
     async def wake(self, how="wake word"):
         events.emit("wake", how=how, score=round(self.wake_score, 2))
-        if self.pending_confirm and not self.pending_confirm.done():
-            self.pending_confirm.set_result("")
-        if self.processing or self.mouth.busy:
-            log.info("barge-in")
-            events.emit("barge_in")
-            self.mouth.stop()
-            if self.processing:
-                await self.brain.interrupt()
+        held = self.held
+        if held:                                   # he's come for the held update: no barge-in, it plays after
+            self.deliver = held
+        else:
+            if self.pending_confirm and not self.pending_confirm.done():
+                self.pending_confirm.set_result("")
+            if self.processing or self.mouth.busy:
+                log.info("barge-in")
+                events.emit("barge_in")
+                self.mouth.stop()
+                if self.processing:
+                    await self.brain.interrupt()
         self.mouth.chime("wake")
         self.begin_listen(None, config.WAIT_FOR_SPEECH_S)
+        self.engaged_listen = self.listen_id if held else None
 
     async def audio_loop(self):
         while True:
@@ -208,8 +227,12 @@ class Jarvis:
                     await self.wake()
                     continue
                 self.wake_score = self.ears.last_score
-                if config.BARGE_IN_BY_VOICE and self.mouth.busy:
-                    await self.check_talk_over(chunk)
+                p = self.ears.vad.predict(chunk, frame_size=640)
+                if p > 0.5:
+                    self.last_voice = time.time()
+                # on a call, his talking is for them: an unprompted update finishes its sentence, then waits
+                if config.BARGE_IN_BY_VOICE and self.mouth.busy and not (self.mouth.polite and self.call.apps):
+                    await self.check_talk_over(chunk, p)
                 else:
                     self.talk_frames.clear()
                     self.talk_run = 0
@@ -240,10 +263,9 @@ class Jarvis:
         finally:
             self.partial_busy = False
 
-    async def check_talk_over(self, chunk):
+    async def check_talk_over(self, chunk, p):
         """The user talking while Jarvis is speaking: stop talking and listen, keeping what they've said so far."""
         self.talk_frames.append(chunk)
-        p = self.ears.vad.predict(chunk, frame_size=640)
         self.talk_run = self.talk_run + 1 if p > 0.6 else 0
         if self.talk_run < 4:                      # about a third of a second of real speech
             return
@@ -263,13 +285,16 @@ class Jarvis:
 
     async def handle_audio(self, audio, target):
         t = time.time()
-        text = await self.ears.transcribe(audio)
+        text = await self.ears.transcribe(audio, answer=bool(target))
         log.info("heard: %s", text or "(nothing)")
         events.emit("heard", text=text, confirm=bool(target), listen_id=self.listen_id, seconds=round(len(audio) / 16000, 1),
                     stt_s=round(time.time() - t, 2))
         if target:
             if not target.done():
                 target.set_result(text)
+        elif text and self.engaged_listen == self.listen_id and GO_AHEAD.match(text):
+            log.info("go ahead: delivering the held update")
+            self.state = BUSY if self.processing else IDLE
         elif text:
             self.inbox.put_nowait(("voice", text))
         else:
@@ -293,7 +318,7 @@ class Jarvis:
             self.processing, self.state = True, BUSY
             self.turn = {"source": source, "text": text, "started": time.time(), "first_speech": None}
             events.emit("turn_start", source=source, text=text)
-            prompt = time_tag() + " " + (text if source == "voice" else f"[typed] {text}")
+            prompt = text if source == "worker" else time_tag() + " " + (text if source == "voice" else f"[typed] {text}")
             print(f"\nYou: {text}", flush=True)
             try:
                 async with self.brain_lock:
@@ -343,20 +368,70 @@ class Jarvis:
         except Exception as e:
             events.emit("error", where="reconnect", error=str(e))
 
-    def speak(self, sentence):
+    def speak(self, sentence, unprompted=False):
         print(f"Jarvis: {sentence}", flush=True)
         if self.turn and self.turn["first_speech"] is None:
             self.turn["first_speech"] = time.time()
             events.emit("first_speech", after_s=round(time.time() - self.turn["started"], 2))
         events.emit("say", text=sentence)
-        self.mouth.say(sentence)
+        unprompted = unprompted or (self.turn or {}).get("source") in ("worker", "self")
+        self.mouth.say(sentence, polite=(self.turn or object()) if unprompted else None)   # one token per update
 
-    async def confirm(self, question):
+    async def hold_for_quiet(self, token, text):
+        """Before an unprompted sentence plays: if the user is on a call (another app has a mic), wait until nobody on it
+        (him on his mic, them on the call's playback) has talked for POLITE_QUIET_S, letting the sentence before
+        finish first. "Hey Jarvis" delivers it once he's said his piece. After POLITE_MAX_WAIT_S a desktop
+        notification too, and it keeps waiting. Not on a call: no wait, same as before."""
+        if not config.POLITE:
+            return
+        gen, start, checked, notified, why = self.mouth.generation, time.time(), 0.0, False, "cancelled"
+        try:
+            while gen == self.mouth.generation:
+                now = time.time()
+                if now - checked >= 1:
+                    checked = now
+                    await self.call.update()
+                    if not self.call.apps:
+                        why = "not on a call"
+                        break
+                    now = time.time()
+                if self.mouth.playing or self.state == LISTEN:
+                    pass                           # the sentence before is finishing, or he's talking to Jarvis
+                elif token is self.deliver:
+                    why = "he asked"
+                    break
+                elif now - max(self.last_voice, self.call.last_heard, self.call.since) >= config.POLITE_QUIET_S:
+                    why = "quiet"
+                    break
+                elif not self.held:
+                    self.held = token
+                    log.info("holding unprompted speech, on a call (%s): %s", ", ".join(self.call.apps), text)
+                    events.emit("polite_hold", apps=self.call.apps, text=text)
+                if not notified and now - start > config.POLITE_MAX_WAIT_S:
+                    notified = True
+                    log.info("held %.0fs: desktop notification, still waiting for quiet", now - start)
+                    events.emit("polite_notify", text=text)
+                    try:
+                        subprocess.Popen(["notify-send", "-a", "Jarvis", "Jarvis has an update", text])
+                    except OSError:
+                        log.exception("notify-send failed")
+                await asyncio.sleep(0.1)
+        finally:
+            if self.held is token:
+                self.held = None
+                log.info("released unprompted speech after %.1fs (%s)", time.time() - start, why)
+                events.emit("polite_release", waited_s=round(time.time() - start, 1), why=why)
+
+    async def confirm(self, question, unprompted=False):
+        async with self.confirm_lock:
+            return await self._confirm(question, unprompted)
+
+    async def _confirm(self, question, unprompted=False):
         await self.mouth.wait_done()
         # the future exists before he hears the question, so a "yes" said over it still counts
         self.pending_confirm = self.loop.create_future()
         self.pending_question = question
-        self.speak(question)
+        self.speak(question, unprompted)
         events.emit("confirm_ask", question=question)
         await self.mouth.wait_done()
         already = self.state == LISTEN and self.listen_target is self.pending_confirm
@@ -370,7 +445,7 @@ class Jarvis:
         self.pending_confirm = self.pending_question = None
         if self.state == BUSY and not self.processing:
             self.state = IDLE                 # the question came from a background job
-        ok = bool(YES.search(answer)) and not NO.search(answer)
+        ok = bool(YES.match(answer)) and not NO.search(answer)
         log.info("confirm %r -> %s", answer, ok)
         events.emit("confirm_answer", question=question, answer=answer, approved=ok)
         return ok
@@ -414,6 +489,8 @@ class Jarvis:
         return "ok"
 
     def activity(self):
+        if self.held and self.state != LISTEN:
+            return "ready"
         if self.pending_question:
             return "waiting"
         if self.state == LISTEN:
@@ -438,8 +515,8 @@ class Jarvis:
         elif k == "heard":
             live["you"] = ev["text"] or "(didn't catch that)"
         elif k == "turn_start":
-            live.update(said="", step="", self_started=ev.get("source") == "self")
-            if ev.get("source") != "self":
+            live.update(said="", step="", self_started=ev.get("source") in ("self", "worker"))
+            if ev.get("source") not in ("self", "worker"):
                 live["you"] = ev.get("text", "")
         elif k == "tool_use" and not ev.get("sub"):
             live["step"] = step_words(ev)
@@ -454,7 +531,7 @@ class Jarvis:
         return {"activity": self.activity(), "mic": round(min(1.0, self.level * 8), 3),
                 "out": round(min(1.0, self.mouth.out_level * 5), 3), "question": self.pending_question or "",
                 "tasks": [{"task_id": t["task_id"], "description": t.get("description", ""), "started": t["started"]}
-                          for t in self.brain.tasks.values()], "now": time.time(), **self.live}
+                          for t in list(self.brain.tasks.values()) + worker.as_tasks()], "now": time.time(), **self.live}
 
     def pulse(self):
         return {"kind": "pulse", "activity": self.activity(), "mic": round(min(1.0, self.level * 8), 3),
@@ -463,7 +540,7 @@ class Jarvis:
     def snapshot(self):
         return {"activity": self.activity(), "state": self.state, "turn": self.turn,
                 "question": self.pending_question, "queued": self.inbox.qsize(),
-                "tasks": list(self.brain.tasks.values()), "brain": self.brain.info, "context": {
+                "tasks": list(self.brain.tasks.values()) + worker.as_tasks(), "brain": self.brain.info, "context": {
                     k: v for k, v in self.brain.context.items() if k != "categories"},
                 "session_id": self.brain.session_id, "started": self.started, "now": time.time(),
                 "session": {"started": self.brain.session_started, "turns": self.brain.session_turns,
@@ -507,6 +584,7 @@ async def main():
     jarvis.ears.stream.close()
     jarvis.mouth.stream.close()
     await jarvis.brain.stop()
+    await worker.stop_all()
     pctools.cleanup()
     if os.path.exists(config.SOCKET_PATH):
         os.remove(config.SOCKET_PATH)

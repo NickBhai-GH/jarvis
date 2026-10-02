@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 
 import numpy as np
 import openwakeword
@@ -118,11 +119,79 @@ class Ears:
         text = await self.loop.run_in_executor(None, run)
         return "" if JUNK.match(text) else text
 
-    async def transcribe(self, audio):
+    async def transcribe(self, audio, answer=False):
+        """answer: the user is answering a yes/no, where a lone "okay" is a real yes, not whisper junk."""
         def run():
             segs, _ = self.whisper.transcribe(audio.astype(np.float32) / 32768.0, language="en",
                                               beam_size=1, vad_filter=True,
                                               initial_prompt=config.VOCAB)
             return " ".join(s.text for s in segs).strip()
         text = await self.loop.run_in_executor(None, run)
+        if answer and re.fullmatch(r"\W*ok(ay)?\W*", text, re.I):
+            return text
         return "" if JUNK.match(text) else text
+
+
+def _pactl(what):
+    return json.loads(subprocess.run(["pactl", "--format=json", "list", what], capture_output=True, text=True,
+                                     timeout=3).stdout)
+
+
+class CallWatch:
+    """Is the user on a call, and are the other people talking? apps: other apps capturing a real mic (Discord, Zoom,
+    Chrome for Meet), not Jarvis and not a monitor. last_heard: when one of those apps' playback streams was last
+    louder than POLITE_CALL_LEVEL (a parec monitor per stream, so music and Jarvis's own voice don't count).
+    The monitors run while Jarvis keeps calling update() and close themselves 10 s after the last call."""
+
+    def __init__(self):
+        self.apps, self.last_heard, self.since, self.asked = [], 0.0, 0.0, 0.0
+        self.readers = {}                            # sink-input index -> task following its loudness
+
+    @staticmethod
+    def scan(pa=_pactl):
+        """(names of other apps holding a mic, indexes of their playback streams). Any failure = not on a call."""
+        try:
+            clients = {str(c["index"]): c["properties"] for c in pa("clients")}
+
+            def who(o):                              # Jarvis's own streams only carry the pid on their client
+                p = o["properties"] if "application.process.id" in o["properties"] else clients.get(str(o["client"]), {})
+                return p.get("application.process.binary") or p.get("application.name", "?"), p.get("application.process.id")
+            mics = {s["index"] for s in pa("sources") if not s.get("monitor_source")}
+            takers = [o for o in pa("source-outputs") if o["source"] in mics and not o.get("corked")
+                      and who(o)[1] != str(os.getpid())]
+            callers = {who(o) for o in takers}       # (binary, pid): flatpak pids alone can repeat across apps
+            streams = [o["index"] for o in pa("sink-inputs") if who(o) in callers and not o.get("corked")]
+            return sorted({name for name, _ in callers}), streams
+        except Exception:
+            log.exception("call check failed")
+            return [], []
+
+    async def update(self):
+        self.asked = time.time()
+        self.apps, streams = await asyncio.get_running_loop().run_in_executor(None, self.scan)
+        self.readers = {i: t for i, t in self.readers.items() if not t.done()}
+        for i in streams:
+            if i not in self.readers:
+                if not self.readers:
+                    self.since = time.time()         # fresh ears on the call: hear QUIET_S of it before trusting it
+                self.readers[i] = asyncio.create_task(self._follow(i))
+
+    async def _follow(self, index):
+        proc = await asyncio.create_subprocess_exec(
+            "parec", f"--monitor-stream={index}", "--format=s16le", "--rate=8000", "--channels=1",
+            "--latency-msec=100", stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            while time.time() - self.asked < 10:
+                try:
+                    data = await asyncio.wait_for(proc.stdout.readexactly(1600), 1)   # 100 ms of audio
+                except asyncio.TimeoutError:
+                    continue                         # a paused stream sends nothing
+                except asyncio.IncompleteReadError:
+                    break                            # the stream ended
+                a = np.frombuffer(data, np.int16).astype(np.float32)
+                if np.sqrt(np.mean(a * a)) > config.POLITE_CALL_LEVEL:
+                    self.last_heard = time.time()
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()

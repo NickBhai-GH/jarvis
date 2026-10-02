@@ -7,7 +7,7 @@ import re
 import string
 import time
 
-from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, PermissionResultAllow,
+from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, HookMatcher, PermissionResultAllow,
                               PermissionResultDeny, ResultMessage, SystemMessage, ToolResultBlock, ToolUseBlock,
                               UserMessage)
 from claude_agent_sdk.types import (TERMINAL_TASK_STATUSES, StreamEvent, TaskNotificationMessage, TaskProgressMessage,
@@ -17,6 +17,7 @@ import config
 import events
 import kwin
 import pctools
+import worker
 from mouth import SentenceSplitter
 
 log = logging.getLogger("brain")
@@ -38,15 +39,23 @@ READ_VERBS = re.compile(r"(^|_)(get|list|search|read|fetch|query|find|describe|w
                         r"shortcuts_list|select_browser|switch_browser)", re.I)
 CHROME_GATED = {"file_upload", "upload_image", "shortcuts_execute"}  # javascript_tool is allowed
 # Only count a word as a command when it sits where a command goes (start, after ; && | ( $( `, or after
-# sudo/xargs/then/do), so a folder named "rm-primary-offer" or a grep for "kill" doesn't trigger the gate.
-_CMD = r"(?:^|[;&|(\n`]|\$\(|\b(?:sudo|xargs|then|do|else|exec|nohup|time|env)\s)\s*"
+# sudo/xargs/then/do), so a folder named "rm-old-notes" or a grep for "kill" doesn't trigger the gate.
+_CMD = (r"(?:^|[;&|(\n`]|\$\(|\b(?:sudo|xargs|then|do|else|exec|nohup|time|env|nice|timeout|command|ionice)\s)"
+        r"(?:\s*-\S+|\s*\d+[smh]?\b)*\s*(?:\S*/)?")        # options/durations after a wrapper; /bin/rm counts as rm
 RISKY_BASH = re.compile(
-    _CMD + r"(rm|rmdir|mv|dd|shred|mkfs\S*|sudo|su|chmod|chown|kill|pkill|killall|shutdown|reboot|poweroff|"
+    _CMD + r"(rm|rmdir|mv|dd|shred|mkfs\S*|sudo|su|kill|pkill|killall|shutdown|reboot|poweroff|"
     r"systemctl|rpm-ostree|truncate|crontab|ssh|scp|rsync)(?=\s|$)"
     r"|" + _CMD + r"flatpak\s+(uninstall|remove)\b|" + _CMD + r"git\s+(push|reset|clean|checkout\s+--)"
-    r"|curl\b.*(-X\s*(POST|PUT|PATCH|DELETE)|\s(-d|--data|-F|--form)\b)|>\s*/(etc|usr|var|boot)", re.I | re.M)
+    r"|curl\b.*(-X\s*(POST|PUT|PATCH|DELETE)|\s(-d|--data|-F|--form)\b)|>\s*/(etc|usr|var|boot)"
+    r"|\bfind\b[^;&|\n]*\s-(delete|exec(dir)?\s+(\S*/)?(rm|shred|mv))\b"           # find ... -delete / -exec rm
+    r"|\b(shutil\.rmtree|os\.(remove|unlink|rmdir|removedirs)|\.unlink\(|\.rmdir\(|send2trash)"  # deletes inside scripts
+    r"|>>?\s*~?\S*/\.(ssh/|bashrc|profile|bash_profile|config/(systemd|autostart)/|claude/settings)",  # shell writes to protected files
+    re.I | re.M)
 SENSITIVE_PATHS = [os.path.join(config.HOME, p) for p in (".ssh", ".gnupg", ".config/systemd", ".config/autostart",
-                                                            ".claude/settings.json", ".bashrc", ".profile")]
+                                                            ".claude/settings.json", ".claude/settings.local.json",
+                                                            ".claude/hooks", ".bashrc", ".profile")] + \
+                  [os.path.join(config.JARVIS_DIR, f) for f in ("brain.py", "worker.py", "config.py", "config_local.py")]
+# ^ the gate, its rules and your allow-lists: an edit here needs your yes (one per request)
 
 
 def humanize(tool_name):
@@ -57,12 +66,36 @@ def humanize(tool_name):
 def describe(tool_name, data):
     if tool_name == "Bash":
         desc = data.get("description")
-        return desc[0].lower() + desc[1:] if desc else f"run this command: {data.get('command', '')[:120]}"
+        if desc:                                   # one short spoken line, never a multi-line read-out
+            desc = desc.splitlines()[0][:100]
+            desc = desc[0].lower() + desc[1:]
+        cmd = data.get("command", "")
+        m = RISKY_BASH.search(cmd)
+        runs = "curl" if m and "curl" in m.group(0) else os.path.basename(m.group(0).split()[-1].strip("`$();&|>")) if m else ""
+        if desc:
+            return desc + (f", which runs {runs}" if runs and runs.lower() not in desc.lower() else "")
+        words = re.sub(r"^\s*cd\s+\S+\s*&&\s*", "", cmd).split()
+        return f"run a {runs or (os.path.basename(words[0]) if words else 'shell')} command"
     if tool_name in ("Write", "Edit", "NotebookEdit"):
         return f"change the file {os.path.basename(data.get('file_path', ''))}"
     hints = [str(v) for k, v in data.items() if isinstance(v, str) and 0 < len(v) < 80
              and k in ("to", "recipient", "subject", "title", "name", "summary", "query", "url", "text")][:2]
     return humanize(tool_name) + (": " + ", ".join(hints) if hints else "")
+
+
+def gate_hooks(gate):
+    """Run the gate as a PreToolUse hook, which comes before Claude Code's allow rules. Calls an allow rule in
+    your settings approves (say python3:* or ssh:*) never reach can_use_tool, so without this the gate never sees
+    them. Steps the policy allows go on exactly as before; the rest are decided here, so nothing is asked twice."""
+    async def hook(data, tool_use_id, context):
+        name, args = data["tool_name"], data["tool_input"]
+        if Brain.policy(name, args)[0] == "allow":
+            return {}
+        r = await gate(name, args, context)
+        ok = isinstance(r, PermissionResultAllow)
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow" if ok else "deny",
+                                       "permissionDecisionReason": "" if ok else r.message}}
+    return {"PreToolUse": [HookMatcher(hooks=[hook], timeout=600)]}   # long enough to wait for your answer
 
 
 NOTES_TEMPLATE = """# Jarvis notes
@@ -179,6 +212,7 @@ class Brain:
         self.reader = None
         self.session_started = time.time()
         self.session_turns = 0
+        self.approved = False          # you said yes once in this request: the rest of it doesn't ask again
 
     def _options(self):
         notes = read_notes().strip()
@@ -191,7 +225,7 @@ class Brain:
             model=config.MODEL, effort=config.EFFORT, cwd=config.HOME, include_partial_messages=True,
             setting_sources=["user", "project", "local"], extra_args={"chrome": None},
             system_prompt={"type": "preset", "preset": "claude_code", "append": append},
-            mcp_servers={"jarvis": pctools.server()}, permission_mode="default", can_use_tool=self.gate,
+            mcp_servers={"jarvis": pctools.server(worker.TOOLS)}, permission_mode="default", can_use_tool=self.gate, hooks=gate_hooks(self.gate),
             max_buffer_size=20 * 1024 * 1024)   # screenshots blew the 1 MB default and killed the reader
 
     async def start(self):
@@ -227,11 +261,14 @@ class Brain:
             return PermissionResultAllow(updated_input=data)
         if verdict == "deny":
             return PermissionResultDeny(message=why)
+        if self.approved:              # one yes per request, not one per step
+            return PermissionResultAllow(updated_input=data)
         question = f"Shall I {describe(tool_name, data)}?"
         if tool_name == "mcp__jarvis__press_keys":
             w = await kwin.active_window()
             question = f"Shall I press Enter in {w['title'] if w else 'the current window'}?"
         if await self.confirm(question):
+            self.approved = True
             return PermissionResultAllow(updated_input=data)
         return PermissionResultDeny(message="The user said no (or didn't answer). Don't retry; tell them briefly.")
 
@@ -266,7 +303,7 @@ class Brain:
 
     async def ask(self, prompt):
         self.turn_future = asyncio.get_running_loop().create_future()
-        self.in_turn, self.auto_turn = True, False
+        self.in_turn, self.auto_turn, self.approved = True, False, False
         await self.client.query(prompt)
         return await self.turn_future
 
@@ -288,7 +325,7 @@ class Brain:
 
     async def _begin_auto_turn(self):
         if not self.in_turn:
-            self.in_turn, self.auto_turn = True, True
+            self.in_turn, self.auto_turn, self.approved = True, True, False
             events.emit("turn_start", source="self", text="(started on its own, e.g. a timer or background job finished)")
             await self.on_auto_turn(True)
 

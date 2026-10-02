@@ -92,6 +92,7 @@ async def open_app(args):
     for q in filter(None, [args["name"], app and app["name"], app and app["id"].split(".")[-1]]):
         w = await kwin.focus(q)
         if w:
+            await seen_window(w)
             return text(f"{w['title']} was already open; brought it to the front.")
     if not app:
         return text(f"No installed app matches '{args['name']}'. Try list_apps.")
@@ -102,6 +103,7 @@ async def open_app(args):
         for q in (app["name"], app["id"].split(".")[-1]):
             w = await kwin.focus(q)
             if w:
+                await seen_window(w)
                 return text(f"Launched {app['name']}; its window '{w['title']}' is in front.")
     return text(f"Launched {app['name']} ({app['id']}) but no window showed up within 15s; it may still be loading.")
 
@@ -188,11 +190,30 @@ async def list_windows(args):
       "or app name, e.g. 'discord', 'thunderbird', 'Konsole'.", {"query": str})
 async def focus_window(args):
     w = await kwin.focus(args["query"])
+    if w:
+        await seen_window(w)
     return text(f"Focused '{w['title']}' at {w['x']},{w['y']} {w['w']}x{w['h']}." if w
                 else f"No open window matches '{args['query']}'. Try list_windows.")
 
 
-LAST_SHOT = {"x": 0, "y": 0, "scale": 1.0}
+LAST_SHOT = {"x": 0, "y": 0, "scale": 1.0, "ts": 0.0, "win": None}   # win: the window in front at the last look
+SHOT_MAX_AGE_S = 60
+
+
+async def seen_window(w=None):
+    """Remember which window is in front: after a screenshot, or after Jarvis himself moved focus."""
+    w = w or await kwin.active_window()
+    LAST_SHOT["win"] = w and w.get("id")
+
+
+async def focus_changed(check_age=False):
+    """A refusal message if another window took focus (a game, a popup) since Jarvis last looked, or the screenshot is
+    too old to click from; None if it's safe. Typing or clicking blind is how text lands in the wrong app."""
+    w = await kwin.active_window()
+    if LAST_SHOT["win"] and w and w.get("id") != LAST_SHOT["win"]:
+        return text(f"Not done: '{w.get('title')}' took focus since your last screenshot. Take a fresh screenshot first.")
+    if check_age and time.time() - LAST_SHOT["ts"] > SHOT_MAX_AGE_S:
+        return text("Not done: the last screenshot is over a minute old. Take a fresh one before clicking.")
 
 
 @tool("screenshot", "Look at the screen. target: 'window' (the active window, sharpest), 'left' or 'right' "
@@ -231,7 +252,8 @@ async def screenshot(args):
     scale = max(1.0, img.width / 1920, img.height / 1080)
     if scale > 1:
         img = img.resize((round(img.width / scale), round(img.height / scale)))
-    LAST_SHOT.update(x=box[0], y=box[1], scale=scale)
+    LAST_SHOT.update(x=box[0], y=box[1], scale=scale, ts=time.time())
+    await seen_window()
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=80)
     save_shot(buf.getvalue(), label)
@@ -318,12 +340,17 @@ BUTTONS = {"left": "0xC0", "right": "0xC1", "middle": "0xC2"}
 @tool("click_at", "Click at a point in the most recent screenshot image (pixel coordinates in that image). "
       "button: left, right or middle. clicks: 1 or 2 (double-click).", {"x": int, "y": int, "button": str, "clicks": int})
 async def click_at(args):
+    refusal = await focus_changed(check_age=True)
+    if refusal:
+        return refusal
     x, y = to_desktop(args["x"], args["y"])
     if not await move_to(x, y):
         return text("Couldn't get the mouse to that spot.")
     button = BUTTONS.get(args.get("button", "left"), "0xC0")
     clicks = max(1, min(3, args.get("clicks", 1)))
     ydotool("click", "--repeat", str(clicks), "--next-delay", "80", button)
+    await asyncio.sleep(0.15)
+    await seen_window()                       # a click may bring another window forward: that one is Jarvis's doing
     return text(f"Clicked {args.get('button', 'left')} x{clicks} at desktop {round(x)},{round(y)}.")
 
 
@@ -345,6 +372,9 @@ async def scroll(args):
 @tool("type_text", "Type text into whatever window has focus, as if on the keyboard. Newlines are NOT allowed; "
       "use press_keys 'enter' separately.", {"text": str})
 async def type_text(args):
+    refusal = await focus_changed()
+    if refusal:
+        return refusal
     t = args["text"].replace("\n", " ")
     ydotool("type", "--key-delay", "4", "--", t)
     return text("Typed.")
@@ -357,10 +387,76 @@ async def press_keys(args):
     missing = [n for n in names if n not in KEYCODES]
     if missing:
         return text(f"Unknown key(s): {', '.join(missing)}.")
+    refusal = await focus_changed()
+    if refusal:
+        return refusal
     codes = [KEYCODES[n] for n in names]
     seq = [f"{c}:1" for c in codes] + [f"{c}:0" for c in reversed(codes)]
     ydotool("key", *seq)
     return text(f"Pressed {args['keys']}.")
+
+
+OVERLAY = {"proc": None}
+SHAPE = {"type": "object", "required": ["type", "x", "y"], "properties": {
+    "type": {"type": "string", "enum": ["ring", "arrow", "rect"]},
+    "x": {"type": "number"}, "y": {"type": "number"}, "radius": {"type": "number"},
+    "from_x": {"type": "number"}, "from_y": {"type": "number"}, "w": {"type": "number"}, "h": {"type": "number"},
+    "label": {"type": "string"}, "step": {"type": "integer"}}}
+
+
+def shapes_to_desktop(shapes):
+    """Screenshot-image coordinates -> desktop pixels, the same mapping click_at uses; sizes scale with it."""
+    out = []
+    for s in shapes:
+        s = dict(s)
+        for kx, ky in (("x", "y"), ("from_x", "from_y")):
+            if kx in s and ky in s:
+                s[kx], s[ky] = to_desktop(float(s[kx]), float(s[ky]))
+        for k in ("radius", "w", "h"):
+            if k in s:
+                s[k] = float(s[k]) * LAST_SHOT["scale"]
+        out.append(s)
+    return out
+
+
+def stop_overlay():
+    if OVERLAY["proc"] and OVERLAY["proc"].poll() is None:
+        OVERLAY["proc"].terminate()
+
+
+@tool("annotate", "Draw on the user's screen to SHOW them where something is (bright yellow, click-through, clears itself). "
+      "Coordinates are pixels in the most recent screenshot image, exactly like click_at. Each shape: "
+      "type 'ring' (x, y = centre, radius), 'arrow' (from_x, from_y -> x, y; the head is at x, y, the target) or "
+      "'rect' (x, y = top-left, w, h); optional label (2-4 words; add '\n' and a short detail line if useful) and step (1, 2, 3 for a sequence). "
+      "duration: seconds before it clears, default 8. A new annotate replaces the old drawing.",
+      {"type": "object", "required": ["shapes"], "properties": {
+          "shapes": {"type": "array", "items": SHAPE}, "duration": {"type": "number"}}})
+async def annotate(args):
+    shapes = args.get("shapes") or []
+    if not shapes:
+        return text("Nothing to draw.")
+    try:
+        desktop = shapes_to_desktop(shapes)
+    except (KeyError, TypeError, ValueError) as e:
+        return text(f"Bad shape: {e}.")
+    duration = max(1.0, min(120.0, float(args.get("duration") or 8)))
+    stop_overlay()
+    log = open(os.path.join(config.JARVIS_DIR, "logs", "overlay.log"), "w")
+    OVERLAY["proc"] = subprocess.Popen(["/usr/bin/python3", os.path.join(config.JARVIS_DIR, "overlay.py"),
+                                        json.dumps({"shapes": desktop, "duration": duration})],
+                                       stdout=log, stderr=log, start_new_session=True)
+    log.close()
+    await asyncio.sleep(0.6)                 # a bad shape or a broken Qt shows up as an instant exit
+    if OVERLAY["proc"].poll() not in (None, 0):
+        with open(os.path.join(config.JARVIS_DIR, "logs", "overlay.log")) as f:
+            return text("The overlay failed: " + f.read()[-400:])
+    return text(f"Drawing {len(shapes)} shape(s) on screen for {duration:g}s.")
+
+
+@tool("clear_annotations", "Remove whatever annotate drew on the screen, right now.", {})
+async def clear_annotations(args):
+    stop_overlay()
+    return text("Cleared.")
 
 
 @tool("notify", "Show a desktop notification (for things worth seeing, like a link or a number to copy).",
@@ -371,13 +467,14 @@ async def notify(args):
 
 
 TOOLS = [open_app, list_apps, open_path, media, volume, list_windows, focus_window, screenshot, click_at,
-         move_mouse, scroll, type_text, press_keys, notify]
+         move_mouse, scroll, type_text, press_keys, annotate, clear_annotations, notify]
 
 
-def server():
-    return create_sdk_mcp_server(name="jarvis", version="1.0.0", tools=TOOLS)
+def server(extra=()):
+    return create_sdk_mcp_server(name="jarvis", version="1.0.0", tools=TOOLS + list(extra))
 
 
 def cleanup():
+    stop_overlay()
     if os.path.exists(YDOTOOL_SOCKET) and shutil.which("pkill"):
         subprocess.run(["pkill", "-f", f"ydotoold -p {YDOTOOL_SOCKET}"])
