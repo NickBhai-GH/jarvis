@@ -9,7 +9,7 @@ How it fits together:
 - `mouth.py`: text to speech (Kokoro by default, or a Piper voice), cut off the moment you talk over it.
 - `pctools.py` + `kwin.py`: the desktop tools, served to Claude as an in-process MCP server called `jarvis`.
 - `worker.py`: background workers, each its own Claude Code session.
-- `jarvis.py`: the main loop. `dashboard.py` + `dashboard.html`: a local web dashboard. `widget.py`: the on-screen status capsule. `overlay.py`: draws rings, arrows and labels on screen. `design.py`: their shared look. `events.py`: the activity log.
+- `jarvis.py`: the main loop. `dashboard.py` + `dashboard.html`: a local web dashboard. `widget.py`: the on-screen status line. `overlay.py`: draws rings, arrows and labels on screen. `design.py`: their shared look. `events.py`: the activity log.
 - `persona.md`: the system prompt, a template filled in from your config. `lines.md`: real JARVIS lines by situation, used to tune the voice.
 
 ## Requirements
@@ -68,7 +68,7 @@ VOCAB = "Jarvis, Pepper, Manchester, Spotify, Discord, Konsole."
 | `WAKE_THRESHOLD` | Raise if it wakes on its own, lower if it ignores you |
 | `END_SILENCE_S` | Raise if it cuts you off mid-sentence |
 | `MIC_DEVICE` | None for the system default input |
-| `WIDGET_*` | Which monitor and corner the widget sits in |
+| `WIDGET_SCREEN` | Which monitor the widget sits on |
 
 Times in the greetings use your system clock and time zone.
 
@@ -117,7 +117,23 @@ Each conversation is a fresh Claude session. A new one starts after 30 minutes i
 
 ## Widget
 
-A Dynamic Island style capsule (bottom centre by default), on top of everything including fullscreen windows, click-through and never focused. Resting, it's a small dark pill. It opens when you start talking and shows what it heard, the step it's on while thinking, and each sentence as it speaks; an orange orb means it's waiting for a yes/no. Previews: `docs/widget-*.png`. It runs as the `jarvis-widget` service, on the system `/usr/bin/python3` (KDE layer-shell needs the system Qt). Move it with `WIDGET_SCREEN` / `WIDGET_CORNER` / `WIDGET_MARGIN_*`. Colours, fonts and motion live in `design.py`.
+A thin glowing "emitter line" at the bottom centre of a monitor, on top of everything including fullscreen windows, click-through and never focused. No box, no blur: at rest it draws nothing. When something happens the line lights up, one colour per state, and the words float above it:
+
+- **Listening**: white, rippling with your voice, your words live above it.
+- **Thinking**: cyan, a spark sweeping to and fro, with the step it's on.
+- **Speaking**: blue, rippling with Jarvis's voice, each sentence as it says it.
+- **Waiting for yes/no**: orange, breathing. **Update ready** (held while you're on a call): green, breathing slower.
+- **Jarvis not running**: a dim red line. Background work at rest: a faint spark drifting along the line.
+
+It fades away a couple of seconds after Jarvis finishes. It looks best on a dark wallpaper with a line of its own at that spot: set `LINE_W` (length) and `LINE_UP` (pixels above the bottom edge) at the top of `widget.py` to sit exactly on it. The words use Rajdhani and Share Tech Mono if you have them installed (both free on Google Fonts), else your normal sans and monospace.
+
+| Listening | Thinking |
+|---|---|
+| ![Listening](docs/widget-listening.png) | ![Thinking](docs/widget-thinking.png) |
+| **Speaking** | **At rest** |
+| ![Speaking](docs/widget-speaking.png) | ![At rest](docs/widget-idle.png) |
+
+It runs as the `jarvis-widget` service, on the system `/usr/bin/python3` (KDE layer-shell needs the system Qt). Pick the monitor with `WIDGET_SCREEN`. Colours, fonts and motion live in `design.py`.
 
 ## Show me where
 

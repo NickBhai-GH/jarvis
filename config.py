@@ -54,9 +54,7 @@ POLITE_MAX_WAIT_S = 60     # held this long: also a desktop notification (still 
 
 # Desktop widget
 WIDGET_SCREEN = "right"        # monitor by connector name (e.g. "HDMI-A-1", "DP-1"), or "left"/"right"
-WIDGET_CORNER = "bottom-center"  # bottom-center, top-center, top-right, top-left, bottom-right, bottom-left
-WIDGET_MARGIN_X = 16           # pixels from the side
-WIDGET_MARGIN_Y = 30           # pixels from the top/bottom
+                               # (it sits at the bottom centre; its size and height: LINE_W / LINE_UP in widget.py)
 
 # Your own settings go in config_local.py (gitignored), e.g. USER_NAME = "Pepper"
 try:
