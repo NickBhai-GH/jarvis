@@ -10,6 +10,7 @@ How it fits together:
 - `pctools.py` + `kwin.py`: the desktop tools, served to Claude as an in-process MCP server called `jarvis`.
 - `worker.py`: background workers, each its own Claude Code session.
 - `jarvis.py`: the main loop. `dashboard.py` + `dashboard.html`: a local web dashboard. `widget.py`: the on-screen status line. `overlay.py`: draws rings, arrows and labels on screen. `design.py`: their shared look. `events.py`: the activity log.
+- `jarvis-os/`: JARVIS OS, an optional full-screen dashboard that sits under your windows like a wallpaper (its own README).
 - `persona.md`: the system prompt, a template filled in from your config. `lines.md`: real JARVIS lines by situation, used to tune the voice.
 
 ## Requirements
@@ -134,6 +135,15 @@ It fades away a couple of seconds after Jarvis finishes. It looks best on a dark
 | ![Speaking](docs/widget-speaking.png) | ![At rest](docs/widget-idle.png) |
 
 It runs as the `jarvis-widget` service, on the system `/usr/bin/python3` (KDE layer-shell needs the system Qt). Pick the monitor with `WIDGET_SCREEN`. Colours, fonts and motion live in `design.py`.
+
+## JARVIS OS (optional dashboard)
+
+A live dashboard for a second monitor that sits under every window like a wallpaper: Slack, Asana, today's calendar,
+Jarvis and its workers, Steam, Twitch, Discord, time, weather, CPU/GPU and what's playing, around a day ring, with a
+work mode and a game mode. Every feed is read-only and optional (missing credentials show sample data); Discord is off
+by default. Setup is in [`jarvis-os/README.md`](jarvis-os/README.md).
+
+![JARVIS OS in work mode](docs/jarvis-os-work.png)
 
 ## Show me where
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=JARVIS OS, the live desktop dashboard
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+WorkingDirectory=%h/jarvis/jarvis-os
+ExecStart=/usr/bin/python3 %h/jarvis/jarvis-os/jarvis_os.py
+Environment=QT_QPA_PLATFORM=wayland
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

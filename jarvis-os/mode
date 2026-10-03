@@ -1,0 +1,9 @@
+#!/bin/sh
+# Switch JARVIS OS: mode game | work | auto. The running dashboard picks it up within a second (no restart).
+# game and work hold until the next scheduled switch (start or end of WORK_HOURS on a weekday); auto follows the schedule.
+d="$HOME/.config/jarvis-os"
+f="$d/mode"
+case "$1" in
+  game|work|auto) mkdir -p "$d" && printf '%s %s\n' "$1" "$(date +%s)" > "$f.tmp" && mv "$f.tmp" "$f" && echo "JARVIS OS: $1 mode" ;;
+  *) echo "usage: $0 game|work|auto" >&2; exit 2 ;;
+esac
